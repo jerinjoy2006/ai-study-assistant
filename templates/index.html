@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StudyMind AI</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@300;400&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+  <div class="app-shell">
+
+    <!-- ── SIDEBAR ── -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">✦</div>
+        <span class="brand-name">StudyMind</span>
+      </div>
+
+      <div class="nav-section">
+        <p class="nav-label">Chat Modes</p>
+        <button class="nav-btn active" data-mode="normal"    onclick="setMode('normal')">
+          <span class="nav-icon">💬</span> General Chat
+          <span class="nav-desc">Open conversation</span>
+        </button>
+        <button class="nav-btn" data-mode="explain" onclick="setMode('explain')">
+          <span class="nav-icon">💡</span> Explain
+          <span class="nav-desc">Break down a concept simply</span>
+        </button>
+        <button class="nav-btn" data-mode="deep_dive" onclick="setMode('deep_dive')">
+          <span class="nav-icon">🔬</span> Deep Dive
+          <span class="nav-desc">In-depth academic analysis</span>
+        </button>
+        <button class="nav-btn" data-mode="flashcard" onclick="setMode('flashcard')">
+          <span class="nav-icon">🃏</span> Flashcards
+          <span class="nav-desc">Generate study cards for a topic</span>
+        </button>
+      </div>
+
+      <div class="nav-section">
+        <p class="nav-label">Session Tools</p>
+        <button class="nav-btn tool-btn" onclick="summarizeSession()">
+          <span class="nav-icon">📋</span> Summarize Session
+          <span class="nav-desc">Recap what we've covered</span>
+        </button>
+        <button class="nav-btn tool-btn accent-quiz" onclick="openQuizModal()">
+          <span class="nav-icon">🎯</span> Quiz Me
+          <span class="nav-desc">Test your knowledge</span>
+        </button>
+        <button class="nav-btn tool-btn danger-btn" onclick="clearMemory()">
+          <span class="nav-icon">🗑️</span> Clear Session
+          <span class="nav-desc">Start fresh</span>
+        </button>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="mode-pill" id="modePill">💬 General Chat</div>
+      </div>
+    </aside>
+
+    <!-- ── MAIN ── -->
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <span class="topbar-title" id="topbarTitle">Study Session</span>
+          <span class="topbar-sub" id="topbarSub">Ask me anything to get started</span>
+        </div>
+        <div class="quiz-hud" id="quizHud" style="display:none">
+          <div class="hud-chip topic-chip" id="hudTopic"></div>
+          <div class="hud-chip" id="hudProgress"></div>
+          <div class="hud-chip score-chip" id="hudScore"></div>
+        </div>
+      </header>
+
+      <div class="chat-area" id="chatArea">
+        <div class="welcome-state" id="welcomeState">
+          <div class="welcome-icon">✦</div>
+          <h2>Welcome to StudyMind</h2>
+          <p>Your AI-powered study companion. Choose a mode from the sidebar or just start chatting.</p>
+          <div class="quick-actions">
+            <button onclick="quickStart('explain')" class="quick-btn">💡 Explain a concept</button>
+            <button onclick="quickStart('deep_dive')" class="quick-btn">🔬 Deep dive a topic</button>
+            <button onclick="quickStart('flashcard')" class="quick-btn">🃏 Make flashcards</button>
+            <button onclick="openQuizModal()" class="quick-btn">🎯 Take a quiz</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Normal input -->
+      <div class="input-bar" id="inputBar">
+        <div class="input-wrap">
+          <textarea id="userInput" rows="1" placeholder="Ask anything…"
+            onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="send-btn" onclick="sendMessage()" title="Send">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </div>
+        <div class="input-hint" id="inputHint">Press Enter to send · Shift+Enter for new line</div>
+      </div>
+
+      <!-- Quiz answer buttons -->
+      <div class="quiz-input-bar" id="quizInputBar" style="display:none">
+        <p class="quiz-prompt-label">Choose your answer:</p>
+        <div class="quiz-opts">
+          <button class="opt-btn" data-choice="A" onclick="sendQuizAnswer('A')"><span class="opt-letter">A</span></button>
+          <button class="opt-btn" data-choice="B" onclick="sendQuizAnswer('B')"><span class="opt-letter">B</span></button>
+          <button class="opt-btn" data-choice="C" onclick="sendQuizAnswer('C')"><span class="opt-letter">C</span></button>
+          <button class="opt-btn" data-choice="D" onclick="sendQuizAnswer('D')"><span class="opt-letter">D</span></button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ── QUIZ MODAL ── -->
+  <div class="modal-overlay" id="modalOverlay" onclick="closeQuizModal()"></div>
+  <div class="modal" id="quizModal">
+    <div class="modal-header">
+      <span class="modal-icon">🎯</span>
+      <h2 class="modal-title">Start a Quiz</h2>
+    </div>
+    <p class="modal-desc">Test your knowledge on any topic with AI-generated questions.</p>
+    <label class="modal-label">Topic</label>
+    <input class="modal-input" id="quizTopic" type="text" placeholder="e.g. Photosynthesis, World War II…" onkeydown="if(event.key==='Enter') startQuiz()" />
+    <label class="modal-label">Number of Questions</label>
+    <div class="count-row">
+      <button class="count-btn" onclick="adjustCount(-1)">−</button>
+      <input class="modal-input count-input" id="quizCount" type="number" min="1" max="20" value="5" />
+      <button class="count-btn" onclick="adjustCount(1)">+</button>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeQuizModal()">Cancel</button>
+      <button class="modal-start" onclick="startQuiz()">Start Quiz →</button>
+    </div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
