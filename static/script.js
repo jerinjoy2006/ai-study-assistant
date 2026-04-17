@@ -20,36 +20,28 @@ const MODE_CONFIG = {
   deep_dive: { label: "🔬 Deep Dive Mode", sub: "Enter a topic for deep analysis", hint: "In-depth academic breakdown" },
   flashcard: { label: "🃏 Flashcard Mode", sub: "Enter a topic for flashcards",   hint: "I'll generate 5 study cards" },
 };
-
-/* ── Markdown renderer ── */
 function renderMarkdown(text) {
   const div = document.createElement("div");
   const lines = text.split("\n");
   let html = "";
 
   for (const line of lines) {
-    // Bold-only heading line e.g. **Key Points:**
     if (/^\*\*[^*]+\*\*[:\s]*$/.test(line.trim())) {
       html += `<div class="md-h3">${line.trim().replace(/\*\*/g, "")}</div>`;
       continue;
     }
-    // Numbered list
     const numM = line.match(/^(\d+)\.\s+(.+)/);
     if (numM) {
       html += `<div class="md-num"><span class="num">${numM[1]}.</span><span>${inline(numM[2])}</span></div>`;
       continue;
     }
-    // Bullet
     const bulM = line.match(/^[-*]\s+(.+)/);
     if (bulM) {
       html += `<div class="md-li"><span>${inline(bulM[1])}</span></div>`;
       continue;
     }
-    // HR
     if (/^---+$/.test(line.trim())) { html += `<div class="md-sep"></div>`; continue; }
-    // Empty
     if (!line.trim()) { html += "<br>"; continue; }
-    // Normal
     html += `<span>${inline(line)}</span><br>`;
   }
   div.innerHTML = html;
@@ -63,7 +55,6 @@ function inline(t) {
     .replace(/`(.+?)`/g,       '<span class="md-code">$1</span>');
 }
 
-/* ── Helpers ── */
 function hideWelcome() {
   const w = document.getElementById("welcomeState");
   if (w) w.style.display = "none";
@@ -122,7 +113,6 @@ function updateQuizHUD(topic, count, total, score) {
   hudScore.textContent    = `✓ ${score}`;
 }
 
-/* ── Mode switch ── */
 async function setMode(mode) {
   if (quizActive) { addMsg("system", "Finish the quiz before switching modes."); return; }
   await post("/set_mode", { mode });
@@ -133,7 +123,6 @@ async function setMode(mode) {
 
 function quickStart(mode) { setMode(mode); userInput.focus(); }
 
-/* ── Summarize session ── */
 async function summarizeSession() {
   if (quizActive) { addMsg("system", "Finish the quiz first."); return; }
   const prevMode = currentMode;
@@ -147,7 +136,6 @@ async function summarizeSession() {
   else addMsg("system", "Error: " + (data.error || "Unknown"));
 }
 
-/* ── Clear ── */
 async function clearMemory() {
   await post("/clear", {});
   chatArea.innerHTML = "";
@@ -171,7 +159,6 @@ async function clearMemory() {
   setModeUI("normal");
 }
 
-/* ── Chat ── */
 async function sendMessage() {
   const text = userInput.value.trim();
   if (!text || quizActive) return;
@@ -193,7 +180,6 @@ function autoResize(el) {
   el.style.height = Math.min(el.scrollHeight, 130) + "px";
 }
 
-/* ── Quiz modal ── */
 function openQuizModal() {
   document.getElementById("modalOverlay").classList.add("open");
   document.getElementById("quizModal").classList.add("open");
@@ -228,7 +214,6 @@ async function startQuiz() {
   }
 }
 
-/* ── Quiz answer ── */
 async function sendQuizAnswer(choice) {
   if (!quizActive) return;
   document.querySelectorAll(".opt-btn").forEach(b => b.disabled = true);
@@ -261,7 +246,6 @@ async function sendQuizAnswer(choice) {
   }
 }
 
-/* ── Fetch helper ── */
 async function post(url, body) {
   const res = await fetch(url, {
     method: "POST",
