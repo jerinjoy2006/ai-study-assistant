@@ -1,32 +1,36 @@
 import os
 import re
 import random
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, Request, Response, Cookie
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.security import OAuth2PasswordBearer
 from groq import Groq
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 load_dotenv()
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
+MONGO_URI     = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+SECRET_KEY    = os.getenv("SECRET_KEY", "change-this-secret-in-production-please")
+ALGORITHM     = "HS256"
+TOKEN_EXPIRE_DAYS = 30
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+groq_client  = Groq(api_key=GROQ_API_KEY)
 mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["studymind"]
+db           = mongo_client["studymind"]
 
-chat_col      = db["chat_sessions"]    
-quiz_col      = db["quiz_results"]     
-flashcard_col = db["flashcards"]       
+users_col = db["users"]
+chat_col  = db["chat_sessions"]
+quiz_col  = db["quiz_results"]
 
-app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SYSTEM_PROMPT = (
     "You are StudyMind, an expert AI study assistant. "
@@ -35,95 +39,90 @@ SYSTEM_PROMPT = (
     "and blank lines between sections."
 )
 
-sessions: dict[str, dict] = {}
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
+user_states: dict[str, dict] = {}
 
-def new_session_state() -> dict:
+def new_user_state() -> dict:
     return {
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
-        "mode": "normal",
-        "quiz_active": False,
-        "quiz_topic": "",
-        "quiz_total": 0,
-        "quiz_count": 0,
-        "score": 0,
-        "correct_answer": "",
+        "messages":        [{"role": "system", "content": SYSTEM_PROMPT}],
+        "mode":            "normal",
+        "quiz_active":     False,
+        "quiz_topic":      "",
+        "quiz_total":      0,
+        "quiz_count":      0,
+        "score":           0,
+        "correct_answer":  "",
         "asked_questions": [],
         "quiz_start_time": None,
-        "quiz_answers": [],  
+        "quiz_answers":    [],
     }
 
+def get_user_state(user_id: str) -> dict:
+    if user_id not in user_states:
+        user_states[user_id] = new_user_state()
+    return user_states[user_id]
 
-def get_state(session_id: str) -> dict:
-    if session_id not in sessions:
-        sessions[session_id] = new_session_state()
-    return sessions[session_id]
+def hash_password(plain: str) -> str:
+    return pwd_ctx.hash(plain)
 
-async def save_chat_message(session_id: str, role: str, content: str, mode: str):
-    """Append a message to the chat session document (upsert)."""
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_ctx.verify(plain, hashed)
+
+def create_token(data: dict) -> str:
+    payload = data.copy()
+    payload["exp"] = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+
+async def get_current_user(request: Request):
+    token = request.cookies.get("sm_token")
+    if not token:
+        return None
+    payload = decode_token(token)
+    if not payload:
+        return None
+    user = await users_col.find_one({"username": payload.get("sub")}, {"_id": 1, "username": 1, "email": 1})
+    return user
+
+async def require_user(request: Request):
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return user
+
+async def save_chat_message(user_id: str, role: str, content: str, mode: str):
     await chat_col.update_one(
-        {"session_id": session_id},
+        {"user_id": user_id},
         {
-            "$push": {
-                "messages": {
-                    "role": role,
-                    "content": content,
-                    "mode": mode,
-                    "timestamp": datetime.now(timezone.utc),
-                }
-            },
-            "$setOnInsert": {
-                "session_id": session_id,
-                "created_at": datetime.now(timezone.utc),
-            },
-            "$set": {"updated_at": datetime.now(timezone.utc)},
+            "$push": {"messages": {
+                "role": role, "content": content,
+                "mode": mode, "timestamp": datetime.now(timezone.utc),
+            }},
+            "$setOnInsert": {"user_id": user_id, "created_at": datetime.now(timezone.utc)},
+            "$set":          {"updated_at": datetime.now(timezone.utc)},
         },
         upsert=True,
     )
 
-async def save_quiz_result(session_id: str, state: dict):
-    """Save a completed quiz to the quiz_results collection."""
-    doc = {
-        "session_id": session_id,
-        "topic": state["quiz_topic"],
-        "score": state["score"],
-        "total": state["quiz_total"],
+async def save_quiz_result(user_id: str, state: dict):
+    await quiz_col.insert_one({
+        "user_id":    user_id,
+        "topic":      state["quiz_topic"],
+        "score":      state["score"],
+        "total":      state["quiz_total"],
         "percentage": round(state["score"] / state["quiz_total"] * 100, 1) if state["quiz_total"] else 0,
-        "answers": state["quiz_answers"],
+        "answers":    state["quiz_answers"],
         "started_at": state.get("quiz_start_time"),
         "finished_at": datetime.now(timezone.utc),
-    }
-    await quiz_col.insert_one(doc)
-
-async def save_flashcards(session_id: str, topic: str, raw_text: str):
-    """Parse and save flashcards generated for a topic."""
-    cards = []
-    blocks = re.split(r"\*\*Card\s*\d+\*\*", raw_text, flags=re.IGNORECASE)
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        q_m = re.search(r"Q:\s*(.+?)(?=A:|$)", block, re.DOTALL | re.IGNORECASE)
-        a_m = re.search(r"A:\s*(.+)",           block, re.DOTALL | re.IGNORECASE)
-        if q_m and a_m:
-            cards.append({
-                "question": q_m.group(1).strip(),
-                "answer":   a_m.group(1).strip(),
-            })
-
-    if cards:
-        await flashcard_col.update_one(
-            {"session_id": session_id, "topic": topic},
-            {
-                "$set": {
-                    "session_id": session_id,
-                    "topic": topic,
-                    "cards": cards,
-                    "generated_at": datetime.now(timezone.utc),
-                }
-            },
-            upsert=True,
-        )
+    })
 
 def build_prompt(mode: str, user_input: str) -> str:
     if mode == "explain":
@@ -157,7 +156,6 @@ def build_prompt(mode: str, user_input: str) -> str:
         )
     return user_input
 
-
 def get_chat_history_text(state: dict) -> str:
     lines = []
     for m in state["messages"][1:]:
@@ -165,12 +163,11 @@ def get_chat_history_text(state: dict) -> str:
         lines.append(f"{role}: {m['content']}")
     return "\n".join(lines) if lines else "No conversation yet."
 
-
 def generate_question(state: dict) -> dict:
-    topic   = state["quiz_topic"]
-    asked   = state["asked_questions"]
-    q_num   = state["quiz_count"] + 1
-    total   = state["quiz_total"]
+    topic = state["quiz_topic"]
+    asked = state["asked_questions"]
+    q_num = state["quiz_count"] + 1
+    total = state["quiz_total"]
 
     avoid_text = ""
     if asked:
@@ -210,55 +207,114 @@ def generate_question(state: dict) -> dict:
         temperature=1.0,
         seed=random.randint(0, 99999),
     )
-    raw = response.choices[0].message.content.strip()
+    raw   = response.choices[0].message.content.strip()
     match = re.search(r"ANSWER:\s*([A-D])", raw, re.IGNORECASE)
 
     if match:
         state["correct_answer"] = match.group(1).upper()
-        state["quiz_count"] += 1
-
-        q_match = re.search(r"QUESTION:\s*(.+)", raw)
-        if q_match:
-            state["asked_questions"].append(q_match.group(1).strip()[:120])
-
+        state["quiz_count"]    += 1
+        q_m = re.search(r"QUESTION:\s*(.+)", raw)
+        if q_m:
+            state["asked_questions"].append(q_m.group(1).strip()[:120])
         lines = [l for l in raw.split("\n") if "ANSWER:" not in l.upper() and l.strip()]
-        return {"ok": True, "question": "\n".join(lines), "number": state["quiz_count"], "raw": raw}
+        return {"ok": True, "question": "\n".join(lines), "number": state["quiz_count"]}
     else:
         return generate_question(state)
 
-SESSION_COOKIE = "sm_session"
-
-
-def get_or_create_session(request: Request, response: Response) -> str:
-    session_id = request.cookies.get(SESSION_COOKIE)
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        response.set_cookie(SESSION_COOKIE, session_id, max_age=60 * 60 * 24 * 30) 
-    return session_id
-
-
 @app.get("/", response_class=HTMLResponse)
-async def root(request: Request, response: Response):
-    session_id = get_or_create_session(request, response)
-    get_state(session_id)   # initialise if new
-    return templates.TemplateResponse(request, "index.html")
+async def root(request: Request):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+    return templates.TemplateResponse(request, "index.html", {"username": user["username"]})
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    user = await get_current_user(request)
+    if user:
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "auth.html", {"mode": "login", "error": None})
+
+@app.get("/signup", response_class=HTMLResponse)
+async def signup_page(request: Request):
+    user = await get_current_user(request)
+    if user:
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "auth.html", {"mode": "signup", "error": None})
+
+@app.post("/api/signup")
+async def api_signup(request: Request):
+    body     = await request.json()
+    username = body.get("username", "").strip().lower()
+    email    = body.get("email", "").strip().lower()
+    password = body.get("password", "")
+
+    if not username or not email or not password:
+        return {"ok": False, "error": "All fields are required."}
+    if len(username) < 3:
+        return {"ok": False, "error": "Username must be at least 3 characters."}
+    if len(password) < 6:
+        return {"ok": False, "error": "Password must be at least 6 characters."}
+
+    existing = await users_col.find_one({"$or": [{"username": username}, {"email": email}]})
+    if existing:
+        if existing.get("username") == username:
+            return {"ok": False, "error": "Username already taken."}
+        return {"ok": False, "error": "Email already registered."}
+
+    await users_col.insert_one({
+        "username":        username,
+        "email":           email,
+        "hashed_password": hash_password(password),
+        "created_at":      datetime.now(timezone.utc),
+    })
+
+    token    = create_token({"sub": username})
+    response = Response(content='{"ok":true}', media_type="application/json")
+    response.set_cookie("sm_token", token, max_age=TOKEN_EXPIRE_DAYS * 86400, httponly=True, samesite="lax")
+    return response
+
+@app.post("/api/login")
+async def api_login(request: Request):
+    body     = await request.json()
+    username = body.get("username", "").strip().lower()
+    password = body.get("password", "")
+
+    user = await users_col.find_one({"username": username})
+    if not user or not verify_password(password, user["hashed_password"]):
+        return {"ok": False, "error": "Invalid username or password."}
+
+    token    = create_token({"sub": username})
+    response = Response(content='{"ok":true}', media_type="application/json")
+    response.set_cookie("sm_token", token, max_age=TOKEN_EXPIRE_DAYS * 86400, httponly=True, samesite="lax")
+    return response
+
+@app.post("/api/logout")
+async def api_logout():
+    response = Response(content='{"ok":true}', media_type="application/json")
+    response.delete_cookie("sm_token")
+    return response
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    user = await get_current_user(request)
+    if not user:
+        return {"ok": False}
+    return {"ok": True, "username": user["username"], "email": user.get("email", "")}
 
 @app.post("/set_mode")
-async def set_mode(request: Request, response: Response, body: dict):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
+async def set_mode(request: Request, body: dict, user=Depends(require_user)):
+    state = get_user_state(str(user["_id"]))
     state["mode"] = body.get("mode", "normal")
     state["quiz_active"] = False
     return {"ok": True, "mode": state["mode"]}
 
-
 @app.post("/chat")
-async def chat(request: Request, response: Response, body: dict):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
+async def chat(request: Request, body: dict, user=Depends(require_user)):
+    user_id    = str(user["_id"])
+    state      = get_user_state(user_id)
     user_input = body.get("message", "").strip()
-    mode = state["mode"]
+    mode       = state["mode"]
 
     if mode == "summarize":
         if len(state["messages"]) <= 1:
@@ -272,86 +328,80 @@ async def chat(request: Request, response: Response, body: dict):
             f"Conversation:\n{history}"
         )
         try:
-            res = groq_client.chat.completions.create(
+            res   = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[state["messages"][0], {"role": "user", "content": summary_prompt}],
             )
             reply = res.choices[0].message.content
-            await save_chat_message(session_id, "assistant", reply, "summarize")
+            await save_chat_message(user_id, "assistant", reply, "summarize")
             return {"ok": True, "reply": reply}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
     prompt = build_prompt(mode, user_input)
     state["messages"].append({"role": "user", "content": prompt})
-    await save_chat_message(session_id, "user", user_input, mode)
+    await save_chat_message(user_id, "user", user_input, mode)
 
     try:
-        res = groq_client.chat.completions.create(
+        res   = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=state["messages"],
         )
         reply = res.choices[0].message.content
         state["messages"].append({"role": "assistant", "content": reply})
-        await save_chat_message(session_id, "assistant", reply, mode)
-        if mode == "flashcard":
-            await save_flashcards(session_id, user_input, reply)
-
+        await save_chat_message(user_id, "assistant", reply, mode)
         return {"ok": True, "reply": reply}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 @app.post("/clear")
-async def clear(request: Request, response: Response):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
-    state.update(new_session_state())
+async def clear(request: Request, user=Depends(require_user)):
+    user_id = str(user["_id"])
+    user_states[user_id] = new_user_state()
     return {"ok": True}
 
-
 @app.post("/quiz/start")
-async def quiz_start(request: Request, response: Response, body: dict):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
-    state["quiz_topic"]      = body.get("topic", "")
-    state["quiz_total"]      = body.get("total", 5)
-    state["quiz_count"]      = 0
-    state["score"]           = 0
-    state["quiz_active"]     = True
-    state["correct_answer"]  = ""
-    state["asked_questions"] = []
-    state["quiz_answers"]    = []
-    state["quiz_start_time"] = datetime.now(timezone.utc)
+async def quiz_start(request: Request, body: dict, user=Depends(require_user)):
+    state = get_user_state(str(user["_id"]))
+    state.update({
+        "quiz_topic":      body.get("topic", ""),
+        "quiz_total":      body.get("total", 5),
+        "quiz_count":      0,
+        "score":           0,
+        "quiz_active":     True,
+        "correct_answer":  "",
+        "asked_questions": [],
+        "quiz_answers":    [],
+        "quiz_start_time": datetime.now(timezone.utc),
+    })
     return generate_question(state)
 
-
 @app.post("/quiz/answer")
-async def quiz_answer(request: Request, response: Response, body: dict):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
-
+async def quiz_answer(request: Request, body: dict, user=Depends(require_user)):
+    user_id = str(user["_id"])
+    state   = get_user_state(user_id)
     if not state["quiz_active"]:
         return {"ok": False, "error": "No active quiz"}
 
-    choice  = body.get("choice", "").upper()
-    correct = state["correct_answer"]
+    choice     = body.get("choice", "").upper()
+    correct    = state["correct_answer"]
     is_correct = choice == correct
     if is_correct:
         state["score"] += 1
+
     state["quiz_answers"].append({
         "question_number": state["quiz_count"],
-        "chosen":     choice,
-        "correct":    correct,
-        "is_correct": is_correct,
+        "chosen":           choice,
+        "correct":          correct,
+        "is_correct":       is_correct,
     })
 
-    finished = state["quiz_count"] >= state["quiz_total"]
+    finished      = state["quiz_count"] >= state["quiz_total"]
     analysis_text = None
 
     if finished:
         state["quiz_active"] = False
-        await save_quiz_result(session_id, state)
-
+        await save_quiz_result(user_id, state)
         ap = (
             f"The student completed a quiz on '{state['quiz_topic']}' "
             f"and scored {state['score']} out of {state['quiz_total']}.\n\n"
@@ -360,115 +410,72 @@ async def quiz_answer(request: Request, response: Response, body: dict):
             f"**Gaps to Address:** Specific areas to review\n\n"
             f"**Study Tip:** One concrete, actionable recommendation\n\nKeep it encouraging but honest."
         )
-        ar = groq_client.chat.completions.create(
+        ar            = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": ap}],
         )
         analysis_text = ar.choices[0].message.content
 
     next_question = None if finished else generate_question(state)
-
     return {
-        "ok": True,
-        "correct": is_correct,
-        "correct_answer": correct,
-        "score": state["score"],
-        "quiz_count": state["quiz_count"],
-        "quiz_total": state["quiz_total"],
-        "finished": finished,
-        "analysis": analysis_text,
-        "next_question": next_question,
+        "ok": True, "correct": is_correct, "correct_answer": correct,
+        "score": state["score"], "quiz_count": state["quiz_count"],
+        "quiz_total": state["quiz_total"], "finished": finished,
+        "analysis": analysis_text, "next_question": next_question,
     }
 
 @app.get("/history/chat")
-async def history_chat(request: Request, response: Response, limit: int = 50):
-    """Return recent chat messages for this session."""
-    session_id = get_or_create_session(request, response)
-    doc = await chat_col.find_one({"session_id": session_id})
+async def history_chat(request: Request, user=Depends(require_user), limit: int = 50):
+    user_id = str(user["_id"])
+    doc     = await chat_col.find_one({"user_id": user_id})
     if not doc:
         return {"ok": True, "messages": []}
     messages = doc.get("messages", [])[-limit:]
     for m in messages:
         if "timestamp" in m:
             m["timestamp"] = m["timestamp"].isoformat()
-    return {"ok": True, "session_id": session_id, "messages": messages}
-
+    return {"ok": True, "messages": messages}
 
 @app.get("/history/quizzes")
-async def history_quizzes(request: Request, response: Response):
-    """Return all quiz results for this session."""
-    session_id = get_or_create_session(request, response)
-    cursor = quiz_col.find(
-        {"session_id": session_id},
-        {"_id": 0},
-        sort=[("finished_at", -1)],
-    )
+async def history_quizzes(request: Request, user=Depends(require_user)):
+    user_id = str(user["_id"])
     results = []
-    async for doc in cursor:
-        for key in ("started_at", "finished_at"):
-            if doc.get(key):
-                doc[key] = doc[key].isoformat()
+    async for doc in quiz_col.find({"user_id": user_id}, {"_id": 0}, sort=[("finished_at", -1)]):
+        for k in ("started_at", "finished_at"):
+            if doc.get(k):
+                doc[k] = doc[k].isoformat()
         results.append(doc)
     return {"ok": True, "quizzes": results}
 
-
-@app.get("/history/flashcards")
-async def history_flashcards(request: Request, response: Response):
-    """Return all flashcard sets for this session."""
-    session_id = get_or_create_session(request, response)
-    cursor = flashcard_col.find(
-        {"session_id": session_id},
-        {"_id": 0},
-        sort=[("generated_at", -1)],
-    )
-    sets = []
-    async for doc in cursor:
-        if doc.get("generated_at"):
-            doc["generated_at"] = doc["generated_at"].isoformat()
-        sets.append(doc)
-    return {"ok": True, "flashcard_sets": sets}
-
-
 @app.get("/stats")
-async def stats(request: Request, response: Response):
-    """Quick stats for this session."""
-    session_id = get_or_create_session(request, response)
-
-    chat_doc   = await chat_col.find_one({"session_id": session_id})
-    quiz_count = await quiz_col.count_documents({"session_id": session_id})
-    fc_count   = await flashcard_col.count_documents({"session_id": session_id})
-
-    total_messages = len(chat_doc.get("messages", [])) if chat_doc else 0
-
-    pipeline = [
-        {"$match": {"session_id": session_id}},
+async def stats(request: Request, user=Depends(require_user)):
+    user_id    = str(user["_id"])
+    chat_doc   = await chat_col.find_one({"user_id": user_id})
+    quiz_count = await quiz_col.count_documents({"user_id": user_id})
+    total_msgs = len(chat_doc.get("messages", [])) if chat_doc else 0
+    pipeline   = [
+        {"$match": {"user_id": user_id}},
         {"$group": {"_id": None, "avg_pct": {"$avg": "$percentage"}, "best_pct": {"$max": "$percentage"}}},
     ]
     agg = await quiz_col.aggregate(pipeline).to_list(1)
-    avg_score  = round(agg[0]["avg_pct"], 1) if agg else None
-    best_score = round(agg[0]["best_pct"], 1) if agg else None
-
     return {
-        "ok": True,
-        "session_id": session_id,
-        "total_messages": total_messages,
-        "quizzes_taken": quiz_count,
-        "flashcard_sets": fc_count,
-        "avg_quiz_score_pct": avg_score,
-        "best_quiz_score_pct": best_score,
+        "ok":                               True,
+        "username":            user["username"],
+        "total_messages":      total_msgs,
+        "quizzes_taken":       quiz_count,
+        "avg_quiz_score_pct":  round(agg[0]["avg_pct"],  1) if agg else None,
+        "best_quiz_score_pct": round(agg[0]["best_pct"], 1) if agg else None,
     }
 
-
 @app.get("/state")
-async def get_state_route(request: Request, response: Response):
-    session_id = get_or_create_session(request, response)
-    state = get_state(session_id)
+async def get_state_route(request: Request, user=Depends(require_user)):
+    state = get_user_state(str(user["_id"]))
     return {
-        "mode": state["mode"],
-        "quiz_active": state["quiz_active"],
-        "quiz_topic": state["quiz_topic"],
-        "quiz_count": state["quiz_count"],
-        "quiz_total": state["quiz_total"],
-        "score": state["score"],
+        "mode":           state["mode"],
+        "quiz_active":    state["quiz_active"],
+        "quiz_topic":     state["quiz_topic"],
+        "quiz_count":     state["quiz_count"],
+        "quiz_total":     state["quiz_total"],
+        "score":          state["score"],
         "history_length": len(state["messages"]) - 1,
     }
