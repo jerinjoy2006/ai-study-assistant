@@ -1,6 +1,14 @@
+# Environment secrets — NEVER commit this
 .env
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.pyd
 .venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

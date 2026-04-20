@@ -18,7 +18,11 @@ load_dotenv()
 
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
 MONGO_URI     = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-SECRET_KEY    = os.getenv("SECRET_KEY", "change-this-secret-in-production-please")
+SECRET_KEY    = os.getenv("SECRET_KEY")
+
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set. Set it before starting the app.")
+
 ALGORITHM     = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
